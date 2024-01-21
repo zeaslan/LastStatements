@@ -1,0 +1,372 @@
+---
+title: "Last Statements by Texas Death Row Inmates"
+author: "Zeynep Aslan"
+output: 
+  github_document:
+    toc: true
+---
+
+<!-- IMPORTANT: To be able to reproduce this report, you need the death_row.csv data. Use Data_Scraping.R file to generate this data before trying to reproduce this report.
+-->
+
+# Overview
+
+This report analyses the [last statements of Texas death row inmates](https://www.tdcj.texas.gov/death_row/dr_executed_offenders.html). Specifically, this report examines the last words of the inmates to reveal the common topics underlying their statements and to explore overall emotional tone of these statements. The report also includes specific analyses looking at the relationship between the inmates' last statements and their demographic information, such as race and age.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+
+# Load required packages
+library(tidyverse)
+library(tidytext)
+library(textrecipes)
+library(topicmodels)
+library(here)
+library(ggwordcloud)
+library(textdata)
+library(tidymodels)
+library(themis)
+library(ranger)
+library(kableExtra)
+
+# Set seed
+set.seed(100)
+
+# Set a global theme for the plots
+theme_set(theme_minimal())
+
+# Read data
+death_row <- read_csv(here("death_row.csv"), show_col_types = FALSE)
+```
+
+```{r remove-no-statement}
+# Remove inmates that made no statement 
+death_row <- death_row %>%
+  filter(!Statement %in% c("None", "None.", "No statement was made.", "Spoken:No",
+                        "Spoken: No.", "No statement given.", "June 27, 2018", "No",
+                        "This inmate declined to make a last statement.",
+                        "No last statement.", "Profanity directed toward staff."))
+```
+
+
+```{r tidy-data}
+
+# Remove the unrelated parts of the text
+death_row <- death_row %>%
+  # Remove parts in parentheses - these either specify modality (spoken vs. written) 
+  # or the language of the statement or describes the behaviors of the inmate
+  mutate(Statement = str_remove_all(Statement, pattern = "\\s*\\([^\\)]+\\)")) %>%
+  # Remove modality info that are not in parentheses
+  mutate(Statement = str_remove_all(Statement, pattern = "Spoken:")) %>%
+  mutate(Statement = str_remove_all(Statement, pattern = "Written:")) %>%
+  mutate(Statement = str_remove_all(Statement, pattern = "Written")) %>%
+  mutate(Statement = str_remove_all(Statement, pattern = "Verbal:")) 
+
+# Tidy the data and remove the stop words
+tidy_death_row <- death_row %>%
+  unnest_tokens(output = word, input = Statement) %>%
+  anti_join(stop_words)
+
+# Select numbers that are identified as words
+nums <- tidy_death_row %>%
+  filter(str_detect(word, "^[0-9]")) %>%
+  select(word) %>%
+  unique()
+
+# Remove the numbers
+tidy_death_row <- tidy_death_row %>%
+  anti_join(nums, by = "word")
+  
+  
+```
+## Most frequent words
+
+Before getting into more detailed analyses, let's check first the most frequent words used by the inmates in their last statements. 
+
+```{r word-cloud, fig.align='left'}
+
+# Build a word cloud with the most frequent 100 words
+word_cloud <- tidy_death_row %>%
+  count(word) %>%
+  slice_max(order_by = n, n = 100) %>%
+  mutate(angle = 90 * sample(c(0, 1), n(), replace = TRUE, prob = c(70, 30))) %>%
+  ggplot(aes(label = word, size = n, angle = angle, color = n)) +
+  geom_text_wordcloud(rm_outside = TRUE) +
+  scale_size_area(max_size = 20) +
+  labs(title = "Figure 1: Most frequent 100 tokens in the last statements of Texas death row \ninmates") +
+  scale_color_gradient(low = "mediumpurple1", high = "darkslateblue")
+
+# Print the graph 
+word_cloud
+```
+
+The word cloud in Figure 1 demonstrates 100 most frequent words used by the Texas death row inmates in their last statements. Darker colors and bigger fonts suggest higher frequency. Looking at the graph, we can see that the word "Love" appears most frequently in the last statements of inmates. 
+
+
+```{r common-words, fig.align='left'}
+
+# Visualize the most frequent words spoken by the inmates
+common_words <- tidy_death_row %>%
+  # only count each word once per statement
+  distinct(Execution, `First Name`, `Last Name`, 
+           TDCJNumber, Age, Date, Race, County,
+           word, .keep_all = TRUE) %>%
+  count(word) %>%
+  arrange(desc(n)) %>%
+  top_n(10) %>%
+  ggplot(mapping = aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "darkseagreen3", color = "darkseagreen4") +
+  labs(x = "",
+       y = "Frequency", 
+       title = "Figure 2: Most frequent 10 words in the last statements of death row inmates") + 
+  coord_flip()
+
+#Print graph
+common_words
+```
+
+Similar to Figure 1, Figure 2 shows the most frequent 10 words used in the last statements of Texas death row inmates. Even from this preliminary analysis, we can observe some clear patterns: Most inmates use their last statements as a chance to express their *love* for their *families* and friends and seek *forgiveness* for their crimes by turning to *religion*. 
+
+### Topic Modeling
+
+Now, let's apply *topic modeling* to the data to uncover the potential themes underlying the last statements of the inmates.  
+
+```{r topic-modeling} 
+# Find out the underlying topic structure of the statements
+
+# Build a recipe to prepare the data
+statements_rec <- recipe(~., data = death_row) %>% 
+  # Tokenize the statements
+  step_tokenize(Statement) %>% 
+  # Remove the stopwords
+  step_stopwords(Statement) %>% 
+  # Calculate the n-grams
+  step_ngram(Statement, num_tokens = 5, min_num_tokens = 1) %>%  
+  # Keep only the most commonly used 2500 tokens
+  step_tokenfilter(Statement, max_tokens = 2500) %>%  
+  # Calculate term-frequency for each token
+  step_tf(Statement)  
+
+# Prepare the recipe and extract the data frame
+  statements_prep <- prep(statements_rec) 
+  statements_df <- bake(statements_prep, new_data = NULL)  
+
+# Convert the data frame into DocumentTermMatrix
+statements_dtm <- statements_df %>% 
+    # Tidy the data frame
+  pivot_longer(  
+      cols = -c(Execution:County),  
+      names_to = "token",  
+      values_to = "n"  
+    ) %>%  
+    # Filter out tokens with frequency = 0
+  filter(n != 0) %>%  
+    # Clean the token column name
+    # Drop empty rows
+  mutate(  
+      token = str_remove(string = token, pattern = "tf_Statement_"),  
+      id = fct_drop(f = as.factor(TDCJNumber))  
+    ) %>%  
+    # Convert the data frame into a DTM
+  cast_dtm(document = id, term = token, value = n)  
+  
+# Estimate an LDA model, setting k = 6
+statements_lda4 <- LDA(statements_dtm, k = 6, control = list(seed = 100))  
+statements_lda4_td <- tidy(statements_lda4)  
+
+# Visualize the top terms for each topic
+top_terms <- statements_lda4_td %>%  
+    group_by(topic) %>%  
+    top_n(5, beta) %>%  
+    ungroup() %>%  
+    arrange(topic, -beta) %>%  
+    mutate(  
+      topic = factor(topic),  
+      term = reorder_within(term, beta, topic)  
+    ) %>%  
+    ggplot(aes(term, beta, fill = topic)) +  
+    geom_bar(alpha = 0.8, stat = "identity", show.legend = FALSE) +  
+    scale_x_reordered() +  
+    scale_fill_brewer(palette = "Set2") + 
+    facet_wrap(facets = vars(topic), scales = "free", ncol = 3) + 
+    labs(title = "Figure 3: Latent topics underlying the last statements of death row inmates",
+         x = "",
+         y = "") +
+    coord_flip()  
+
+# Print the graph
+top_terms
+```  
+
+Figure 3 shows 6 potential topics underlying the last statements of the death row inmates. All 6 topics look pretty much the same, there are no clear patterns that can differentiate the topics from each other. 5 out of 6 topics include the word *love* (topics 1, 2, 4, 5, and 6) and half of the topics reveal the remorse of the inmate with the words *sorry* and *forgive* (topics 2, 3, and 6). Some of the topics also include religious references such as words *holy* and *god* (topics 3 and 6). It is important to note that the topics does not become any more distinguishable/interpretable by increasing or decreasing the number of models specified in model structure.    
+
+## Most Frequent Words by Race
+
+In this part of the report, we will analyze whether or not we can estimate the races of inmates depending on their last statements. Before running a predictive model to test this question, let's check the most frequent words used by inmates of each race. 
+
+```{r by-race, fig.align='left'}
+
+# Visualize the most frequent words by race
+ word_byrace <- tidy_death_row %>%
+  # filter out the race "other"
+  filter(Race != "Other") %>%
+  distinct(Execution, `First Name`, `Last Name`, 
+           TDCJNumber, Age, Date, Race, County,
+           word, .keep_all = TRUE) %>%
+  count(Race, word) %>%
+  group_by(Race) %>%
+  slice_max(order_by = n, n = 10) %>%
+  mutate(word = reorder_within(word, n, Race)) %>%
+  ggplot(aes(x = word, y = n, fill = Race)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  scale_fill_brewer(palette = "Pastel1") + 
+  labs(x = "",
+       y = "Frequency",
+       title = "Figure 4: Most frequent words in the last statements of death row inmates",
+       subtitle = "By race") +
+  facet_wrap(facets = vars(Race), scales = "free") +
+  coord_flip()
+
+# Print the graph
+word_byrace
+
+```
+
+Figure 4 demonstrates the most frequent words used by inmates of different races in their last statements. When we compare the graphs, we can see that there is a great deal of consistency between race groups in terms of the themes of the last statements: As also shown in Figure 1 and 2, inmates of all races express their love for their families and ask for forgiveness from the God in their last statements.   
+
+### Predictive Modeling
+
+Now, let's estimate a *random forest model* with 10-folds cross-validation to test if we can predict the race of an inmate based purely on their last statements. 
+
+```{r predictive-modeling}
+
+# Based on their last statements, can we predict the races of the inmates? 
+
+# Filter out the "other" as there very few data points
+death_row_race <- death_row %>%
+  filter(Race != "Other")
+
+# Split the data into training and testing sets
+statements_split <- initial_split(data = death_row_race, strata = Race, prop = 0.75)
+statements_train <- training(statements_split)
+statements_test <- testing(statements_split)
+
+# Create cross-validation folds
+statements_folds <- vfold_cv(data = statements_train, strata = Race)
+
+# Build the recipe
+statements_rec <- recipe(Race ~ Statement, data = death_row_race) %>%
+  # Tokenize the last statements
+  step_tokenize(Statement) %>%
+  # Remove stop words
+  step_stopwords(Statement) %>%
+  # Keep top 500 tokens
+  step_tokenfilter(Statement, max_tokens = 500) %>%
+  # Calculate tf-idf scores
+  step_tfidf(Statement) %>%
+  # Correct the names of the scores
+  step_rename_at(starts_with("tfidf_Statement_"),
+    fn = ~ str_replace_all(
+      string = .,
+      pattern = "tfidf_Statement_",
+      replacement = ""
+    )
+  ) %>%
+  # Downsample the observations by race
+  step_downsample(Race)
+
+# Define a random forest model
+ranger_spec <- rand_forest(trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+# Build the workflow
+ranger_workflow <- workflow() %>%
+  add_recipe(statements_rec) %>%
+  add_model(ranger_spec)
+
+# Fit the model
+ranger_cv <- ranger_workflow %>%
+  fit_resamples(
+    resamples = statements_folds,
+    control = control_resamples(save_pred = TRUE)
+  ) 
+
+ranger_cv_metrics <- collect_metrics(ranger_cv)
+
+# Build a table to demonstrate the output
+kable(ranger_cv_metrics[1, 1:5], align = 'c',
+      col.names = c("Metric", "Estimator", "Mean", "n", "Standard Error"),
+      caption = "Table 1: Random Forest Model (10-folds)",
+      digits = 2)
+
+# Draw a confusion matrix
+conf_mat_resampled(x = ranger_cv, tidy = FALSE) %>%
+ autoplot(type = "heatmap") + 
+ scale_fill_gradient(low = "wheat", high = "darkorange1", trans = "log") +  
+ labs(title = "Figure 5: Confusion Matrix")
+```
+
+Table 1 shows the performance of the model. The average accuracy of the model was `r formatC((ranger_cv_metrics$mean[1])*100, digits =2)`%, which is not great at all. Confusion matrix also displays the sub-optimal performance of the model. We can see that the model most accurately predicts the races of White individuals but even that performance is very bad. Overall, the results of the predictive model suggests that the last statements of inmates do not carry much informative value about the races of their speakers. 
+
+
+## Sentiment Analyses 
+
+Finally, let's estimate the sentiment of the last statements of the death row inmates. 
+
+
+```{r bing}
+
+# Visualize the most frequent positive and negative words
+death_row_bing <- tidy_death_row %>%
+  # filter for emotional words using `bing` dataset
+  inner_join(get_sentiments("bing")) %>%
+  distinct(Execution, `First Name`, `Last Name`, 
+           TDCJNumber, Age, Date, Race, County,
+           word, sentiment, .keep_all = TRUE) %>%
+  group_by(sentiment) %>%
+  # count the number of occurrences 
+  count(word) %>%
+  group_by(sentiment) %>%
+  slice_max(order_by = n, n = 10) %>%
+  mutate(word = reorder_within(word, n, sentiment)) %>%
+  ggplot(mapping = aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  scale_fill_brewer(palette = "Set2") + 
+  facet_wrap(facets = vars(sentiment), scales = "free_y") +
+  labs(
+    title = "Figure 6: Sentimental words used in the last statements of the death row inmates",
+    x = NULL,
+    y = "Frequency"
+  ) +
+  coord_flip()  
+
+# Print graph
+death_row_bing
+```
+
+Figure 6 demonstrates the top 10 most frequently used positive and negative words in the last statements of the death row inmates. The last statements of the inmates generally have a positive rather than negative tone. This is interesting and quite tragic, considering that these words were uttered by people who were in the last few minutes of their lives. However, when positive words are examined more closely, it can be understood where this positivity stems from: It seems like inmates made peace with the fact that their lives were about to end and they were ready to pass to the 'other side'. On another note, the word ***love*** outweighs in the last statements of inmates (i.e., more than half of the inmates who made a statement articulated the word *love* in their statements) and this is because inmates also use their last statements to express their love for their families who were there for their execution. 
+
+```{r age-sentiment}
+
+# Visualize the relationship between sentiment of words and age of the inmates
+death_row_bing <- tidy_death_row %>%
+  # filter for emotional words using `afinn` dataset
+  inner_join(get_sentiments("afinn")) %>%
+  group_by(Age) %>%
+  summarise(mean_sentiment = mean(as.numeric(value))) %>%
+  ggplot(mapping = aes(x = Age, y = mean_sentiment)) +
+  geom_point() + 
+  geom_smooth(method = "lm", color = "magenta4") + 
+  labs(y = "Sentiment Score",
+       title = "Figure 7: The relationship between age and sentiment score of last statements")
+
+# Print graph
+death_row_bing
+
+```
+ 
+Lastly, Figure 7 demonstrates the relationship between the ages of the inmates at the time of their execution and the sentiment level of their last statements. The sentiment level of each word in a last statement is coded using the [AFINN](https://search.r-project.org/CRAN/refmans/textdata/html/lexicon_afinn.html) dataset. AFINN is a lexicon of English words rated for valence with a range between -5 (negative) to 5 (positive). As can be seen from Figure 1, across all ages, the last statements of the inmates are slightly positive. However, there seems to be no relationship between inmates' ages and the sentiment level of their last statements. 
+
